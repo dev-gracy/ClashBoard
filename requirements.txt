@@ -1,0 +1,7 @@
+# ClashBoard Dependencies
+# Built on standard library Python 3 & Tkinter
+
+matplotlib>=3.8.0
+numpy>=1.26.0
+pytest>=8.0.0
+
