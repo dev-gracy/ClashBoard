@@ -236,8 +236,8 @@ class ClashBoardApp(tk.Tk):
     def _reset_seed_data(self):
         if messagebox.askyesno(
             "Confirm Reset",
-            "This will clear the current database and restore realistic demo data\n"
-            "(6 subjects, ~15 timetable slots, 4 exams, 20 topics, sample clashes and plan).\n\n"
+            "This will clear the current database and restore the realistic demo data\n"
+            "(7 subjects, 26 timetable slots based on your timetable, 5 exams, 24 topics, sample clashes and plan).\n\n"
             "Proceed with reset?"
         ):
             seed_database(self.conn, force=True)

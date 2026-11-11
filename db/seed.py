@@ -1,12 +1,22 @@
 """
 Database Seeder for ClashBoard.
-Populates realistic demo data on first run:
-- 6 subjects with varied difficulty and credits
-- ~15 weekly timetable slots with an intentional class-class clash
-- 4 upcoming exams with intentional exam-exam and class-exam clashes
-- 3-4 topics per subject with varied priorities
-- Pre-scanned clash records
-- Pre-scheduled study sessions with planned and done statuses
+Populated from the actual timetable image (Day Order 1–5 system).
+
+Subjects (from timetable):
+  DS  — Data Structures              (Dr. Ramachandran)
+  T&T — Transforms and Techniques    (Dr. V. Raja, 103175)
+  OS  — Operating Systems            (Dr. S. Priyadharshini)
+  PE  — Professional Ethics          (Dr. J. Michael Raj)
+  UHV — Universal Human Values II    (Dr. Poongothai E)
+  CO  — Computer Organization & Arch (Dr. M. Maheswari)
+  AP  — Advanced Programming         (Dr. Suresh Anand M.)
+
+Time slots (24-hr):
+  P1  08:00–08:50   P2  08:50–09:40
+  P3  09:45–10:35   P4  10:40–11:30
+  P5  11:35–12:25   P6  12:30–13:20
+  P7  13:25–14:15   P8  14:20–15:10
+  P9  15:10–16:00   P10 16:00–16:50
 """
 import datetime
 from db import queries
@@ -15,171 +25,193 @@ from services.scheduler import get_free_slots, build_schedule
 
 
 def seed_database(conn, force=False):
-    """
-    Seeds the database if Subjects table is empty (or if force=True).
-    """
+    """Seeds the database if empty (or if force=True)."""
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM Subjects")
-    count = cursor.fetchone()[0]
-    if count > 0 and not force:
-        return False  # Already seeded
+    if cursor.fetchone()[0] > 0 and not force:
+        return False
 
-    # Clear existing data if forced
-    if force:
-        with conn:
-            conn.execute("DELETE FROM Clashes")
-            conn.execute("DELETE FROM StudySessions")
-            conn.execute("DELETE FROM Topics")
-            conn.execute("DELETE FROM Exams")
-            conn.execute("DELETE FROM Timetable")
-            conn.execute("DELETE FROM Subjects")
+    # ── Clear existing data ──────────────────────────────────────────────────
+    with conn:
+        conn.executescript("""
+            PRAGMA foreign_keys = OFF;
+            DELETE FROM Clashes;
+            DELETE FROM StudySessions;
+            DELETE FROM Topics;
+            DELETE FROM Exams;
+            DELETE FROM Timetable;
+            DELETE FROM Subjects;
+            DELETE FROM Settings;
+            DELETE FROM sqlite_sequence WHERE name IN
+                ('Clashes','StudySessions','Topics','Exams','Timetable','Subjects');
+            PRAGMA foreign_keys = ON;
+        """)
 
     today = datetime.date.today()
 
+    # ── Pivot: This week's Monday = Day Order 1 ──────────────────────────────
+    monday = today - datetime.timedelta(days=today.weekday())
+    queries.set_setting(conn, 'pivot_date', monday.strftime('%Y-%m-%d'))
+    queries.set_setting(conn, 'pivot_day_order', '1')
+
+    # ════════════════════════════════════════════════════════════════════════
     # 1. SUBJECTS
+    # ════════════════════════════════════════════════════════════════════════
     subjects_data = [
-        {"name": "Data Structures & Algorithms", "code": "CS301", "difficulty_level": 4, "credits": 4},
-        {"name": "Operating Systems", "code": "CS302", "difficulty_level": 4, "credits": 4},
-        {"name": "Linear Algebra & Optimization", "code": "MA201", "difficulty_level": 5, "credits": 4},
-        {"name": "Computer Networks", "code": "CS303", "difficulty_level": 3, "credits": 3},
-        {"name": "Digital Logic & Architecture", "code": "EC201", "difficulty_level": 3, "credits": 3},
-        {"name": "Professional Ethics & Comm", "code": "HS101", "difficulty_level": 1, "credits": 2},
+        # (name, code, difficulty 1–5, credits)
+        ("Data Structures",                 "DS",  4, 4),
+        ("Transforms and Techniques",       "T&T", 5, 4),
+        ("Operating Systems",               "OS",  4, 4),
+        ("Professional Ethics",             "PE",  1, 2),
+        ("Universal Human Values II",       "UHV", 1, 2),
+        ("Computer Organization & Arch",    "CO",  3, 4),
+        ("Advanced Programming",            "AP",  3, 4),
     ]
+    sid = {}   # code → subject_id
+    for name, code, diff, cred in subjects_data:
+        sid[code] = queries.insert_subject(conn, name, code, diff, cred)
 
-    subject_ids = {}
-    for s in subjects_data:
-        sid = queries.insert_subject(conn, s["name"], s["code"], s["difficulty_level"], s["credits"])
-        subject_ids[s["code"]] = sid
-
-    # 2. TIMETABLE SLOTS (~15 slots)
-    # Includes an intentional clash on Monday (11:00 - 11:30 overlap)
+    # ════════════════════════════════════════════════════════════════════════
+    # 2. TIMETABLE  (read directly from the uploaded image, Day Order 1–5)
+    # ════════════════════════════════════════════════════════════════════════
+    # Format: (subject_code, day_order, start_time, end_time, room/section)
     timetable_data = [
-        # Monday
-        {"code": "CS301", "day": "Mon", "start": "10:00", "end": "11:30", "sec": "Lecture L1"},
-        {"code": "EC201", "day": "Mon", "start": "11:00", "end": "12:30", "sec": "Lab B2"},  # Clashes with CS301 (11:00-11:30)
-        {"code": "MA201", "day": "Mon", "start": "14:00", "end": "15:30", "sec": "Lecture"},
-        # Tuesday
-        {"code": "CS302", "day": "Tue", "start": "09:00", "end": "10:30", "sec": "Lecture"},
-        {"code": "CS303", "day": "Tue", "start": "11:00", "end": "12:30", "sec": "Lecture"},
-        {"code": "HS101", "day": "Tue", "start": "14:00", "end": "15:30", "sec": "Seminar"},
-        # Wednesday
-        {"code": "CS301", "day": "Wed", "start": "10:00", "end": "11:30", "sec": "Tutorial"},
-        {"code": "MA201", "day": "Wed", "start": "12:00", "end": "13:30", "sec": "Problem Set"},
-        {"code": "EC201", "day": "Wed", "start": "15:00", "end": "16:30", "sec": "Lecture"},
-        # Thursday
-        {"code": "CS302", "day": "Thu", "start": "09:00", "end": "11:00", "sec": "Lab OS"},
-        {"code": "CS303", "day": "Thu", "start": "11:30", "end": "13:00", "sec": "Lecture"},
-        {"code": "MA201", "day": "Thu", "start": "14:00", "end": "15:30", "sec": "Tutorial"},
-        # Friday
-        {"code": "CS301", "day": "Fri", "start": "10:00", "end": "11:30", "sec": "Lecture L2"},
-        {"code": "CS303", "day": "Fri", "start": "12:00", "end": "13:30", "sec": "Network Lab"},
-        {"code": "HS101", "day": "Fri", "start": "14:30", "end": "16:00", "sec": "Discussion"},
+        # ── Day Order 1 ────────────────────────────────────────────────────
+        ("DS",  1, "09:45", "10:35", "CLS 403"),   # P3
+        ("DS",  1, "10:40", "11:30", "CLS 403"),   # P4
+        ("T&T", 1, "12:30", "13:20", "TP 704"),    # P6
+        ("T&T", 1, "13:25", "14:15", "TP 704"),    # P7
+        ("OS",  1, "14:20", "15:10", "TP 704"),    # P8
+        ("OS",  1, "15:10", "16:00", "TP 704"),    # P9
+
+        # ── Day Order 2 ────────────────────────────────────────────────────
+        ("DS",  2, "08:00", "08:50", "TP 704"),    # P1
+        ("DS",  2, "08:50", "09:40", "TP 704"),    # P2
+        ("T&T", 2, "11:35", "12:25", "TP 704"),    # P5
+        ("PE",  2, "12:30", "13:20", "ONLINE"),    # P6
+        ("UHV", 2, "13:25", "14:15", "UB 801"),   # P7
+        ("UHV", 2, "14:20", "15:10", "UB 801"),   # P8
+
+        # ── Day Order 3 ────────────────────────────────────────────────────
+        ("CO",  3, "12:30", "13:20", "TP 704"),    # P6
+        ("CO",  3, "13:25", "14:15", "TP 704"),    # P7
+        ("T&T", 3, "14:20", "15:10", "TP 704"),    # P8
+        ("AP",  3, "15:10", "16:00", "TP 704"),    # P9
+        ("DS",  3, "16:00", "16:50", "TP 704"),    # P10
+
+        # ── Day Order 4 ────────────────────────────────────────────────────
+        ("AP",  4, "08:00", "08:50", "TP 704"),    # P1
+        ("AP",  4, "08:50", "09:40", "TP 704"),    # P2
+        ("DS",  4, "09:45", "10:35", "TP 704"),    # P3
+        ("CO",  4, "11:35", "12:25", "TP 704"),    # P5
+        ("OS",  4, "15:10", "16:00", "UB 714B"),   # P9
+        ("OS",  4, "16:00", "16:50", "UB 714B"),   # P10
+
+        # ── Day Order 5 ────────────────────────────────────────────────────
+        ("CO",  5, "14:20", "15:10", "TP 704"),    # P8
+        ("OS",  5, "15:10", "16:00", "TP 704"),    # P9
+        ("AP",  5, "16:00", "16:50", "TP 704"),    # P10
     ]
 
-    for t in timetable_data:
-        queries.insert_timetable_slot(
-            conn,
-            subject_id=subject_ids[t["code"]],
-            day_of_week=t["day"],
-            start_time=t["start"],
-            end_time=t["end"],
-            section=t["sec"]
-        )
+    for code, do, st, et, room in timetable_data:
+        queries.insert_timetable_slot(conn, sid[code], do, st, et, room)
 
+    # ════════════════════════════════════════════════════════════════════════
     # 3. UPCOMING EXAMS
-    # Place exams on specific dates relative to today
-    # Find next Monday for a class-exam clash
-    days_to_next_mon = (0 - today.weekday() + 7) % 7
-    if days_to_next_mon == 0:
-        days_to_next_mon = 7
-    next_mon = today + datetime.timedelta(days=days_to_next_mon)
-    
-    exam_date_1 = (today + datetime.timedelta(days=8)).strftime("%Y-%m-%d")
-    exam_date_2 = (today + datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-    exam_date_mon = next_mon.strftime("%Y-%m-%d")
+    # Seed exams a few weeks out for the main technical subjects.
+    # Also plant a deliberate exam-exam clash on the same date for DS and T&T.
+    # ════════════════════════════════════════════════════════════════════════
+    exam_date_1 = (today + datetime.timedelta(days=10)).strftime("%Y-%m-%d")  # DS
+    exam_date_2 = (today + datetime.timedelta(days=14)).strftime("%Y-%m-%d")  # T&T + OS clash
+    exam_date_3 = (today + datetime.timedelta(days=21)).strftime("%Y-%m-%d")  # CO + AP
 
     exams_data = [
-        # Clashes with Monday 10:00-11:30 class
-        {"code": "CS301", "date": exam_date_mon, "start": "10:30", "end": "12:30"},
-        # Same date exams (exam_date_2) -> Exam-Exam clash (14:30 - 16:00 overlap)
-        {"code": "MA201", "date": exam_date_2, "start": "14:00", "end": "16:00"},
-        {"code": "CS302", "date": exam_date_2, "start": "14:30", "end": "16:30"},
-        # Non-clashing exam
-        {"code": "CS303", "date": exam_date_1, "start": "09:00", "end": "11:00"},
+        # (subject_code, exam_date, start, end)
+        ("DS",  exam_date_1, "09:00", "12:00"),
+        ("T&T", exam_date_2, "09:00", "12:00"),
+        ("OS",  exam_date_2, "10:00", "13:00"),   # Clashes with T&T (10:00–12:00 overlap)
+        ("CO",  exam_date_3, "09:00", "12:00"),
+        ("AP",  exam_date_3, "14:00", "17:00"),
     ]
+    for code, edate, st, et in exams_data:
+        queries.insert_exam(conn, sid[code], edate, st, et)
 
-    for e in exams_data:
-        queries.insert_exam(
-            conn,
-            subject_id=subject_ids[e["code"]],
-            exam_date=e["date"],
-            start_time=e["start"],
-            end_time=e["end"]
-        )
-
-    # 4. TOPICS (3-4 topics per subject)
+    # ════════════════════════════════════════════════════════════════════════
+    # 4. TOPICS  (3–4 per subject, based on actual syllabus)
+    # ════════════════════════════════════════════════════════════════════════
     topics_data = [
-        # CS301 (Difficulty 4)
-        {"code": "CS301", "name": "Binary Search Trees & AVL", "hours": 3.0, "priority": 5},
-        {"code": "CS301", "name": "Graph Algorithms (Dijkstra)", "hours": 3.5, "priority": 5},
-        {"code": "CS301", "name": "Dynamic Programming Patterns", "hours": 4.0, "priority": 5},
-        {"code": "CS301", "name": "Hash Tables & Collisions", "hours": 2.0, "priority": 3},
-        # CS302 (Difficulty 4)
-        {"code": "CS302", "name": "Process Sync & Semaphores", "hours": 3.0, "priority": 4},
-        {"code": "CS302", "name": "Virtual Memory & Paging", "hours": 2.5, "priority": 4},
-        {"code": "CS302", "name": "Banker's Algorithm & Deadlocks", "hours": 2.0, "priority": 4},
-        {"code": "CS302", "name": "File System Architecture", "hours": 1.5, "priority": 2},
-        # MA201 (Difficulty 5)
-        {"code": "MA201", "name": "Eigenvalues & Diagonalization", "hours": 3.5, "priority": 5},
-        {"code": "MA201", "name": "Singular Value Decomposition (SVD)", "hours": 4.0, "priority": 5},
-        {"code": "MA201", "name": "Vector Spaces & Orthogonality", "hours": 3.0, "priority": 4},
-        {"code": "MA201", "name": "Convex Optimization", "hours": 2.0, "priority": 3},
-        # CS303 (Difficulty 3)
-        {"code": "CS303", "name": "TCP Congestion & Flow Control", "hours": 2.5, "priority": 3},
-        {"code": "CS303", "name": "IP Subnetting & CIDR", "hours": 2.0, "priority": 4},
-        {"code": "CS303", "name": "Routing Protocols (OSPF/BGP)", "hours": 2.0, "priority": 3},
-        # EC201 (Difficulty 3)
-        {"code": "EC201", "name": "Karnaugh Maps & Combinational Logic", "hours": 2.0, "priority": 3},
-        {"code": "EC201", "name": "Sequential Circuits & Flip-Flops", "hours": 2.5, "priority": 3},
-        {"code": "EC201", "name": "ALU & Pipelined Datapath", "hours": 2.5, "priority": 3},
-        # HS101 (Difficulty 1)
-        {"code": "HS101", "name": "Technical Paper Style & Citations", "hours": 1.5, "priority": 1},
-        {"code": "HS101", "name": "Engineering Ethics Case Studies", "hours": 1.5, "priority": 2},
+        # (subject_code, topic_name, estimated_hours, priority)
+
+        # Data Structures
+        ("DS",  "Arrays, Stacks, and Queues",         2.0, 3),
+        ("DS",  "Linked Lists and Variants",           2.0, 3),
+        ("DS",  "Binary Search Trees and AVL Trees",   3.0, 5),
+        ("DS",  "Graph Algorithms (BFS/DFS/Dijkstra)", 3.5, 5),
+        ("DS",  "Hashing and Collision Resolution",    2.0, 4),
+
+        # Transforms and Techniques
+        ("T&T", "Fourier Series and Transforms",       3.5, 5),
+        ("T&T", "Laplace Transforms",                  3.0, 5),
+        ("T&T", "Z-Transforms and Discrete Systems",   3.0, 4),
+        ("T&T", "Numerical Methods: Interpolation",    2.5, 4),
+
+        # Operating Systems
+        ("OS",  "Process Scheduling Algorithms",       2.5, 4),
+        ("OS",  "Deadlocks and Banker's Algorithm",    2.5, 5),
+        ("OS",  "Virtual Memory and Page Replacement", 3.0, 5),
+        ("OS",  "File System Implementation",          2.0, 3),
+
+        # Professional Ethics
+        ("PE",  "Engineering Ethics Frameworks",       1.5, 2),
+        ("PE",  "Intellectual Property and Plagiarism",1.0, 1),
+
+        # Universal Human Values II
+        ("UHV", "Self-Exploration and Human Goal",     1.5, 2),
+        ("UHV", "Harmony in Society and Nature",       1.5, 1),
+
+        # Computer Organization & Architecture
+        ("CO",  "ALU Design and Datapath",             2.5, 4),
+        ("CO",  "Pipelined Processor Architecture",    3.0, 5),
+        ("CO",  "Memory Hierarchy and Cache Design",   2.5, 4),
+        ("CO",  "I/O Systems and Interrupts",          2.0, 3),
+
+        # Advanced Programming
+        ("AP",  "OOP: Inheritance and Polymorphism",   2.0, 3),
+        ("AP",  "Exception Handling and File I/O",     2.0, 3),
+        ("AP",  "Multi-threading and Concurrency",     2.5, 4),
+        ("AP",  "Data Structures in Python/Java",      2.0, 4),
     ]
 
-    for tp in topics_data:
-        queries.insert_topic(
-            conn,
-            subject_id=subject_ids[tp["code"]],
-            topic_name=tp["name"],
-            estimated_hours=tp["hours"],
-            priority=tp["priority"]
-        )
+    for code, tname, hrs, prio in topics_data:
+        queries.insert_topic(conn, sid[code], tname, hrs, prio)
 
-    # 5. DETECT INITIAL CLASHES & SAVE
+    # ════════════════════════════════════════════════════════════════════════
+    # 5. DETECT INITIAL CLASHES
+    # ════════════════════════════════════════════════════════════════════════
     slots = queries.get_all_timetable_slots(conn)
     all_exams = queries.get_all_exams(conn)
-    detected = detect_clashes(slots, all_exams)
+    pivot_date = queries.get_setting(conn, 'pivot_date')
+    pivot_do   = int(queries.get_setting(conn, 'pivot_day_order', '1'))
+    detected   = detect_clashes(slots, all_exams, pivot_date, pivot_do)
     queries.save_clashes(conn, detected)
 
-    # 6. BUILD INITIAL STUDY SCHEDULE
-    all_topics = queries.get_all_topics(conn)
-    planning_days = [today + datetime.timedelta(days=i) for i in range(14)]
-    free_slots = get_free_slots(slots, planning_days, exams=all_exams)
-    schedule_result = build_schedule(all_topics, free_slots, reference_date=today)
+    # ════════════════════════════════════════════════════════════════════════
+    # 6. BUILD INITIAL STUDY SCHEDULE (next 21 working days)
+    # ════════════════════════════════════════════════════════════════════════
+    all_topics    = queries.get_all_topics(conn)
+    planning_days = [today + datetime.timedelta(days=i) for i in range(21)]
+    free_slots    = get_free_slots(slots, planning_days, all_exams, pivot_date, pivot_do)
+    plan          = build_schedule(all_topics, free_slots, reference_date=today)
 
-    # Insert planned sessions
-    # Mark the first session as 'done' to demonstrate progress in dashboard and planner
-    for idx, s in enumerate(schedule_result['sessions']):
-        status = 'done' if idx == 0 else 'planned'
+    # Insert all planned sessions; mark first one 'done' as a demo
+    for idx, s in enumerate(plan['sessions']):
         queries.insert_study_session(
             conn,
-            topic_id=s['topic_id'],
-            scheduled_date=s['scheduled_date'],
-            scheduled_start=s['scheduled_start'],
-            scheduled_end=s['scheduled_end'],
-            status=status
+            topic_id        = s['topic_id'],
+            scheduled_date  = s['scheduled_date'],
+            scheduled_start = s['scheduled_start'],
+            scheduled_end   = s['scheduled_end'],
+            status          = 'done' if idx == 0 else 'planned',
         )
 
     return True
-

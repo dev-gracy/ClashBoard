@@ -1,115 +1,106 @@
 """
-Weekly Planner Screen for ClashBoard (Main Screen).
-Canvas-drawn 7-day grid showing:
-- Classes from weekly timetable (subtle background blocks)
-- Study sessions color-coded by subject with planned/done/missed statuses
-- Clickable session cards to mark Done or Missed (triggers reflow_on_missed)
-- Week navigation (Prev, Today, Next)
-- Unscheduled topics warning banner
+Weekly Planner Screen for ClashBoard.
+
+Canvas-drawn 7-day calendar with:
+  • Day headers showing BOTH weekday (Mon/Tue/…) and Day Order (DO1–DO5)
+  • Timetable class blocks rendered for the Day Order of each calendar day
+  • Study session cards, colour-coded by subject, click to mark Done/Missed
+  • Missed → triggers reflow_on_missed and immediately redraws the grid
+  • Week navigation + Auto-Generate Study Plan button
+  • Day Order Pivot configurator so the DO↔weekday mapping can be adjusted
 """
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import datetime
 from db import queries
 from services.clash_detector import time_to_minutes
 from services.scheduler import get_free_slots, build_schedule, reflow_on_missed
+from services.day_order import get_day_order, day_order_label
 from gui.styles import (
     BG_COLOR, CARD_BG, ACCENT_COLOR, TEXT_COLOR, MUTED_TEXT,
     BORDER_COLOR, STATUS_DONE, STATUS_MISSED, STATUS_PLANNED,
-    STATUS_WARNING, get_subject_colors
+    STATUS_WARNING, get_subject_colors,
 )
+
+DAYS_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 
 class PlannerScreen(ttk.Frame):
     def __init__(self, parent, conn, on_data_change=None):
         super().__init__(parent, style='TFrame')
-        self.conn = conn
-        self.on_data_change = on_data_change
+        self.conn            = conn
+        self.on_data_change  = on_data_change
+        self.session_card_map: dict[str, dict] = {}
+        self.unscheduled_topics: list = []
 
-        # Current view week starting on Monday
         today = datetime.date.today()
         self.current_monday = today - datetime.timedelta(days=today.weekday())
-
-        self.session_card_map = {}  # canvas_tag -> session_dict
-        self.unscheduled_topics = []
 
         self._build_ui()
         self.refresh()
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # Layout
+    # ═══════════════════════════════════════════════════════════════════════
+
     def _build_ui(self):
-        # Top toolbar
+        # Toolbar
         toolbar = ttk.Frame(self, style='TFrame')
         toolbar.pack(fill='x', padx=20, pady=(15, 8))
 
-        # Left: Title and week navigation
-        nav_box = ttk.Frame(toolbar, style='TFrame')
-        nav_box.pack(side='left', fill='y')
+        nav = ttk.Frame(toolbar, style='TFrame')
+        nav.pack(side='left')
 
-        ttk.Label(nav_box, text="Weekly Study Planner", style='Header.TLabel').pack(side='left', padx=(0, 15))
+        ttk.Label(nav, text="Weekly Study Planner", style='Header.TLabel').pack(side='left', padx=(0, 15))
+        ttk.Button(nav, text="◀ Prev",        style='Secondary.TButton', command=self._prev_week).pack(side='left', padx=2)
+        ttk.Button(nav, text="Current Week",  style='Secondary.TButton', command=self._this_week).pack(side='left', padx=2)
+        ttk.Button(nav, text="Next ▶",        style='Secondary.TButton', command=self._next_week).pack(side='left', padx=2)
 
-        btn_prev = ttk.Button(nav_box, text="◀ Prev", style='Secondary.TButton', command=self._prev_week)
-        btn_prev.pack(side='left', padx=2)
+        self.lbl_week = ttk.Label(nav, text="", font=('Segoe UI', 10, 'bold'), foreground=TEXT_COLOR)
+        self.lbl_week.pack(side='left', padx=(12, 0))
 
-        btn_today = ttk.Button(nav_box, text="Current Week", style='Secondary.TButton', command=self._this_week)
-        btn_today.pack(side='left', padx=2)
+        actions = ttk.Frame(toolbar, style='TFrame')
+        actions.pack(side='right')
+        ttk.Button(actions, text="🗓 Set Day Order Pivot", style='Secondary.TButton',
+                   command=self._configure_pivot).pack(side='right', padx=4)
+        ttk.Button(actions, text="⚡ Auto-Generate Study Plan", style='Accent.TButton',
+                   command=self._generate_plan_dialog).pack(side='right', padx=4)
 
-        btn_next = ttk.Button(nav_box, text="Next ▶", style='Secondary.TButton', command=self._next_week)
-        btn_next.pack(side='left', padx=2)
-
-        self.lbl_week_range = ttk.Label(nav_box, text="", font=('Segoe UI', 10, 'bold'), foreground=TEXT_COLOR)
-        self.lbl_week_range.pack(side='left', padx=(12, 0))
-
-        # Right: Action buttons
-        actions_box = ttk.Frame(toolbar, style='TFrame')
-        actions_box.pack(side='right')
-
-        btn_generate = ttk.Button(
-            actions_box,
-            text="⚡ Auto-Generate Study Plan",
-            style='Accent.TButton',
-            command=self._generate_plan_dialog
+        # Pivot info bar
+        self.lbl_pivot_info = ttk.Label(
+            self, text="", font=('Segoe UI', 9, 'italic'), foreground=MUTED_TEXT
         )
-        btn_generate.pack(side='right', padx=4)
+        self.lbl_pivot_info.pack(fill='x', padx=20, pady=(0, 4))
 
-        # Warning banner for unscheduled topics
-        self.banner_frame = tk.Frame(self, bg='#FDF2E9', relief='solid', borderwidth=1, highlightbackground=STATUS_WARNING)
-        self.lbl_banner = tk.Label(
-            self.banner_frame,
-            text="",
-            font=('Segoe UI', 9, 'bold'),
-            fg='#8A4206',
-            bg='#FDF2E9',
-            justify='left'
-        )
+        # Warning banner (unscheduled topics)
+        self.banner_frame = tk.Frame(self, bg='#FDF2E9', relief='solid',
+                                     borderwidth=1, highlightbackground=STATUS_WARNING)
+        self.lbl_banner = tk.Label(self.banner_frame, text="", font=('Segoe UI', 9, 'bold'),
+                                   fg='#8A4206', bg='#FDF2E9', justify='left')
         self.lbl_banner.pack(side='left', padx=12, pady=6)
-        # Not packed initially, packed when unscheduled topics exist
 
-        # Subject Palette Legend Bar
+        # Subject palette legend
         self.legend_frame = ttk.Frame(self, style='TFrame')
-        self.legend_frame.pack(fill='x', padx=20, pady=(0, 6))
+        self.legend_frame.pack(fill='x', padx=20, pady=(0, 4))
 
-        # Canvas container with vertical scrollbar
-        grid_container = ttk.Frame(self, style='TFrame')
-        grid_container.pack(fill='both', expand=True, padx=20, pady=(0, 15))
+        # Canvas + scrollbar
+        grid_ctr = ttk.Frame(self, style='TFrame')
+        grid_ctr.pack(fill='both', expand=True, padx=20, pady=(0, 15))
 
-        self.canvas = tk.Canvas(grid_container, bg=BG_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR)
-        self.v_scrollbar = ttk.Scrollbar(grid_container, orient='vertical', command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.v_scrollbar.set)
-
+        self.canvas = tk.Canvas(grid_ctr, bg=BG_COLOR,
+                                highlightthickness=1, highlightbackground=BORDER_COLOR)
+        self.vscroll = ttk.Scrollbar(grid_ctr, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vscroll.set)
         self.canvas.pack(side='left', fill='both', expand=True)
-        self.v_scrollbar.pack(side='right', fill='y')
+        self.vscroll.pack(side='right', fill='y')
 
-        # Bind resize and canvas clicks
-        self.canvas.bind('<Configure>', self._on_canvas_configure)
-        self.canvas.bind('<Button-1>', self._on_canvas_click)
-
-        # Mouse wheel scrolling
+        self.canvas.bind('<Configure>', lambda e: self.draw_grid())
+        self.canvas.bind('<Button-1>',  self._on_canvas_click)
         self.canvas.bind_all('<MouseWheel>', self._on_mousewheel)
 
-    def _on_mousewheel(self, event):
-        # Only scroll if this screen is visible
-        if self.winfo_viewable():
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    # ═══════════════════════════════════════════════════════════════════════
+    # Week navigation
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _prev_week(self):
         self.current_monday -= datetime.timedelta(days=7)
@@ -124,306 +115,341 @@ class PlannerScreen(ttk.Frame):
         self.current_monday = today - datetime.timedelta(days=today.weekday())
         self.refresh()
 
-    def _on_canvas_configure(self, event):
-        self.draw_grid()
+    def _on_mousewheel(self, event):
+        if self.winfo_viewable():
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Pivot configuration dialog
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _configure_pivot(self):
+        """Let the user set which date and Day Order to use as the mapping anchor."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Configure Day Order Pivot")
+        dlg.geometry("380x200")
+        dlg.configure(bg=BG_COLOR)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        pad = ttk.Frame(dlg, style='TFrame', padding=20)
+        pad.pack(fill='both', expand=True)
+
+        current_pivot = queries.get_setting(self.conn, 'pivot_date') or ''
+        current_do    = queries.get_setting(self.conn, 'pivot_day_order') or '1'
+
+        ttk.Label(pad, text="Reference Date (YYYY-MM-DD):", style='TLabel').grid(row=0, column=0, sticky='w', pady=6)
+        entry_date = ttk.Entry(pad, width=18)
+        entry_date.insert(0, current_pivot)
+        entry_date.grid(row=0, column=1, padx=8, pady=6)
+
+        ttk.Label(pad, text="Day Order on that date:", style='TLabel').grid(row=1, column=0, sticky='w', pady=6)
+        cb_do = ttk.Combobox(pad, values=["Day 1","Day 2","Day 3","Day 4","Day 5"], state='readonly', width=12)
+        cb_do.set(f"Day {current_do}")
+        cb_do.grid(row=1, column=1, padx=8, pady=6)
+
+        ttk.Label(pad, text="(Sets the anchor for all Day Order calculations)",
+                  style='Muted.TLabel').grid(row=2, column=0, columnspan=2, sticky='w', pady=(0, 8))
+
+        def save():
+            date_str = entry_date.get().strip()
+            do_str   = cb_do.get()
+            do_num   = int(do_str.split()[-1]) if do_str else 1
+            try:
+                datetime.date.fromisoformat(date_str)
+            except ValueError:
+                messagebox.showwarning("Invalid Date", "Enter date as YYYY-MM-DD", parent=dlg)
+                return
+            queries.set_setting(self.conn, 'pivot_date',       date_str)
+            queries.set_setting(self.conn, 'pivot_day_order',  str(do_num))
+            dlg.destroy()
+            self.refresh()
+
+        ttk.Button(pad, text="Save", style='Accent.TButton', command=save).grid(
+            row=3, column=0, columnspan=2, pady=(8, 0))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Refresh entry point
+    # ═══════════════════════════════════════════════════════════════════════
 
     def refresh(self):
-        """Refreshes week header, legend, and redraws the grid."""
+        self.pivot_date = queries.get_setting(self.conn, 'pivot_date')
+        self.pivot_do   = int(queries.get_setting(self.conn, 'pivot_day_order', '1'))
+
         sunday = self.current_monday + datetime.timedelta(days=6)
-        self.lbl_week_range.config(
+        self.lbl_week.config(
             text=f"{self.current_monday.strftime('%b %d')} – {sunday.strftime('%b %d, %Y')}"
+        )
+        self.lbl_pivot_info.config(
+            text=f"Day Order Pivot: {self.pivot_date}  = Day {self.pivot_do}  "
+                 f"(Day 1 = Mon, Day 2 = Tue … by default)"
         )
         self._refresh_legend()
         self.draw_grid()
 
     def _refresh_legend(self):
-        # Clear existing legend items
-        for widget in self.legend_frame.winfo_children():
-            widget.destroy()
-
+        for w in self.legend_frame.winfo_children():
+            w.destroy()
         ttk.Label(self.legend_frame, text="Subjects:", font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 8))
+        for s in queries.get_all_subjects(self.conn):
+            bc, fc = get_subject_colors(s['subject_id'])
+            f = ttk.Frame(self.legend_frame, style='TFrame')
+            f.pack(side='left', padx=5)
+            tk.Canvas(f, width=12, height=12, bg=bc, highlightthickness=0).pack(side='left', padx=(0, 3))
+            ttk.Label(f, text=s['code'] or s['name'], font=('Segoe UI', 8)).pack(side='left')
 
-        subjects = queries.get_all_subjects(self.conn)
-        for s in subjects:
-            border_c, fill_c = get_subject_colors(s['subject_id'])
-            item_f = ttk.Frame(self.legend_frame, style='TFrame')
-            item_f.pack(side='left', padx=6)
-
-            swatch = tk.Canvas(item_f, width=12, height=12, bg=border_c, highlightthickness=0)
-            swatch.pack(side='left', padx=(0, 4))
-
-            lbl = ttk.Label(item_f, text=s['code'] or s['name'], font=('Segoe UI', 8))
-            lbl.pack(side='left')
+    # ═══════════════════════════════════════════════════════════════════════
+    # Canvas grid drawing
+    # ═══════════════════════════════════════════════════════════════════════
 
     def draw_grid(self):
-        """Draws the 7-day grid and plots timetable classes & study sessions."""
         self.canvas.delete('all')
         self.session_card_map.clear()
 
-        width = self.canvas.winfo_width()
-        if width <= 100:
-            width = 960  # Default fallback width before geometry manager stabilizes
+        width = self.canvas.winfo_width() or 980
 
         # Grid metrics
-        time_col_w = 60
-        header_h = 44
-        total_days = 7
-        day_col_w = (width - time_col_w) / total_days
+        time_col_w  = 64
+        header_h    = 54            # taller header to show DO + weekday
+        total_days  = 7
+        day_col_w   = (width - time_col_w) / total_days
 
-        # Time range: 07:00 (420) to 23:00 (1380) = 16 hours
-        start_hour = 7
-        end_hour = 23
+        # Visible time range: 07:00–17:30 (covers all class periods + early study)
+        # For evening study sessions the scrollbar allows seeing further
+        start_hour  = 7
+        end_hour    = 23
         total_hours = end_hour - start_hour
-        hour_h = 52
-        grid_h = header_h + (total_hours * hour_h)
+        hour_h      = 54
+        grid_h      = header_h + total_hours * hour_h
 
-        # Configure scrollregion
         self.canvas.configure(scrollregion=(0, 0, width, grid_h + 20))
 
-        # Background headers
+        week_dates = [self.current_monday + datetime.timedelta(days=i) for i in range(7)]
+        today      = datetime.date.today()
+
+        # ── Background header strip ──────────────────────────────────────
         self.canvas.create_rectangle(0, 0, width, header_h, fill='#EDECE6', outline=BORDER_COLOR)
 
-        days_of_week = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-        week_dates = [self.current_monday + datetime.timedelta(days=i) for i in range(7)]
-        today = datetime.date.today()
-
-        # Draw Day Columns and Headers
-        for i in range(total_days):
-            x1 = time_col_w + i * day_col_w
+        # ── Day columns ──────────────────────────────────────────────────
+        for idx, dt in enumerate(week_dates):
+            x1 = time_col_w + idx * day_col_w
             x2 = x1 + day_col_w
-            dt = week_dates[i]
-            is_today = (dt == today)
+            is_today  = (dt == today)
+            is_wkend  = (dt.weekday() >= 5)
+            day_order = get_day_order(dt, self.pivot_date, self.pivot_do) if not is_wkend else None
 
             # Header cell
-            header_bg = '#DDE4DC' if is_today else '#EDECE6'
-            self.canvas.create_rectangle(x1, 0, x2, header_h, fill=header_bg, outline=BORDER_COLOR)
+            hdr_bg = '#DDE4DC' if is_today else ('#EAEAE6' if is_wkend else '#EDECE6')
+            self.canvas.create_rectangle(x1, 0, x2, header_h, fill=hdr_bg, outline=BORDER_COLOR)
 
-            day_text = f"{days_of_week[i]} {dt.strftime('%d %b')}"
-            header_font = ('Segoe UI', 9, 'bold' if is_today else 'normal')
-            header_fg = ACCENT_COLOR if is_today else TEXT_COLOR
-            self.canvas.create_text((x1 + x2) / 2, header_h / 2, text=day_text, font=header_font, fill=header_fg)
+            # Weekday label (always shown)
+            weekday_txt = dt.strftime('%a %d %b')
+            hdr_font    = ('Segoe UI', 9, 'bold' if is_today else 'normal')
+            hdr_fg      = ACCENT_COLOR if is_today else (MUTED_TEXT if is_wkend else TEXT_COLOR)
+            self.canvas.create_text((x1 + x2) / 2, header_h * 0.32,
+                                    text=weekday_txt, font=hdr_font, fill=hdr_fg)
 
-            # Day column background
-            col_bg = '#FBFBF9' if i % 2 == 0 else '#F7F6F2'
+            # Day Order badge  (only on weekdays)
+            if day_order:
+                do_txt  = f"Day {day_order}"
+                do_bg   = ACCENT_COLOR if is_today else '#7A9A78'
+                do_x1   = (x1 + x2) / 2 - 22
+                do_x2   = (x1 + x2) / 2 + 22
+                do_y1   = header_h * 0.58
+                do_y2   = header_h * 0.90
+                self.canvas.create_rectangle(do_x1, do_y1, do_x2, do_y2,
+                                             fill=do_bg, outline='', width=0)
+                self.canvas.create_text((x1 + x2) / 2, (do_y1 + do_y2) / 2,
+                                        text=do_txt, font=('Segoe UI', 8, 'bold'), fill='white')
+            else:
+                # Weekend indicator
+                self.canvas.create_text((x1 + x2) / 2, header_h * 0.72,
+                                        text="Weekend", font=('Segoe UI', 7, 'italic'), fill=MUTED_TEXT)
+
+            # Column background
+            col_bg = '#F3F2EF' if is_wkend else ('#FBFBF9' if idx % 2 == 0 else '#F7F6F2')
             self.canvas.create_rectangle(x1, header_h, x2, grid_h, fill=col_bg, outline=BORDER_COLOR)
 
-        # Draw Hour Rows & Time Labels
+        # ── Time axis ────────────────────────────────────────────────────
         for h in range(start_hour, end_hour + 1):
-            y = header_h + (h - start_hour) * hour_h
-            time_str = f"{h:02d}:00"
+            y   = header_h + (h - start_hour) * hour_h
+            lbl = f"{h:02d}:00"
+            self.canvas.create_text(time_col_w / 2, y, text=lbl,
+                                    font=('Segoe UI', 8), fill=MUTED_TEXT)
+            self.canvas.create_line(time_col_w, y, width, y,
+                                    fill='#E5E3DB', dash=(2, 4) if h != start_hour else ())
 
-            # Label on time column
-            self.canvas.create_text(time_col_w / 2, y, text=time_str, font=('Segoe UI', 8), fill=MUTED_TEXT)
-            # Grid line
-            self.canvas.create_line(time_col_w, y, width, y, fill='#E5E3DB', dash=(2, 4) if h != start_hour else ())
+        # Pre-load timetable by day_order
+        all_slots = queries.get_all_timetable_slots(self.conn)
+        slots_by_do: dict[int, list] = {}
+        for s in all_slots:
+            slots_by_do.setdefault(int(s['day_order']), []).append(s)
 
-        # --- 1. DRAW TIMETABLE CLASSES (Background blocks) ---
-        timetable_slots = queries.get_all_timetable_slots(self.conn)
-        for s in timetable_slots:
-            day_name = s.get('day_of_week', '').capitalize()[:3]
-            if day_name not in days_of_week:
-                continue
-            day_idx = days_of_week.index(day_name)
-
-            s_min = time_to_minutes(s['start_time'])
-            e_min = time_to_minutes(s['end_time'])
-            
-            # Map minutes to Y
-            y1 = header_h + ((s_min - (start_hour * 60)) / 60.0) * hour_h
-            y2 = header_h + ((e_min - (start_hour * 60)) / 60.0) * hour_h
-            x1 = time_col_w + day_idx * day_col_w + 3
-            x2 = x1 + day_col_w - 6
-
-            if y2 > header_h and y1 < grid_h:
-                y1_clamp = max(y1, header_h)
-                y2_clamp = min(y2, grid_h)
-
-                # Class background card (subtle hatching/dash)
-                self.canvas.create_rectangle(
-                    x1, y1_clamp, x2, y2_clamp,
-                    fill='#EBE8DF',
-                    outline='#BEBBAF',
-                    dash=(3, 3)
-                )
-                title = f"🏛 {s.get('subject_code', '')} {s.get('section', '')}"
-                self.canvas.create_text(
-                    x1 + 6, y1_clamp + 8,
-                    text=title,
-                    anchor='nw',
-                    font=('Segoe UI', 8, 'italic'),
-                    fill='#555555'
-                )
-
-        # --- 2. DRAW EXAMS (If any in this week) ---
+        # Pre-load exams
         all_exams = queries.get_all_exams(self.conn)
+
+        # ── Draw timetable class blocks ───────────────────────────────────
+        for idx, dt in enumerate(week_dates):
+            if dt.weekday() >= 5:
+                continue
+            day_order = get_day_order(dt, self.pivot_date, self.pivot_do)
+            if not day_order:
+                continue
+
+            for s in slots_by_do.get(day_order, []):
+                self._draw_class_block(s, idx, day_col_w, time_col_w, header_h, start_hour, hour_h, grid_h)
+
+        # ── Draw exam blocks ──────────────────────────────────────────────
         for ex in all_exams:
             ex_date_str = ex.get('exam_date')
-            for day_idx, dt in enumerate(week_dates):
+            for idx, dt in enumerate(week_dates):
                 if dt.strftime('%Y-%m-%d') == ex_date_str:
-                    s_min = time_to_minutes(ex['start_time'])
-                    e_min = time_to_minutes(ex['end_time'])
-                    y1 = header_h + ((s_min - (start_hour * 60)) / 60.0) * hour_h
-                    y2 = header_h + ((e_min - (start_hour * 60)) / 60.0) * hour_h
-                    x1 = time_col_w + day_idx * day_col_w + 3
-                    x2 = x1 + day_col_w - 6
+                    self._draw_exam_block(ex, idx, day_col_w, time_col_w, header_h, start_hour, hour_h, grid_h)
 
-                    self.canvas.create_rectangle(
-                        x1, y1, x2, y2,
-                        fill='#FADBD8',
-                        outline=STATUS_MISSED,
-                        width=2
-                    )
-                    self.canvas.create_text(
-                        x1 + 6, y1 + 6,
-                        text=f"⚠️ EXAM: {ex.get('subject_code', '')}",
-                        anchor='nw',
-                        font=('Segoe UI', 8, 'bold'),
-                        fill='#78281F'
-                    )
-
-        # --- 3. DRAW STUDY SESSIONS ---
-        start_date_str = self.current_monday.strftime('%Y-%m-%d')
-        end_date_str = (self.current_monday + datetime.timedelta(days=6)).strftime('%Y-%m-%d')
-        sessions = queries.get_study_sessions_by_date_range(self.conn, start_date_str, end_date_str)
+        # ── Draw study sessions ───────────────────────────────────────────
+        start_str = self.current_monday.strftime('%Y-%m-%d')
+        end_str   = (self.current_monday + datetime.timedelta(days=6)).strftime('%Y-%m-%d')
+        sessions  = queries.get_study_sessions_by_date_range(self.conn, start_str, end_str)
 
         for sess in sessions:
-            sess_dt_str = sess.get('scheduled_date')
             try:
-                sess_dt = datetime.date.fromisoformat(sess_dt_str)
-                day_idx = (sess_dt - self.current_monday).days
+                sess_dt  = datetime.date.fromisoformat(sess['scheduled_date'])
+                day_idx  = (sess_dt - self.current_monday).days
             except Exception:
                 continue
-
             if 0 <= day_idx < 7:
-                s_min = time_to_minutes(sess['scheduled_start'])
-                e_min = time_to_minutes(sess['scheduled_end'])
+                self._draw_session_card(sess, day_idx, day_col_w, time_col_w,
+                                        header_h, start_hour, hour_h, grid_h)
 
-                y1 = header_h + ((s_min - (start_hour * 60)) / 60.0) * hour_h
-                y2 = header_h + ((e_min - (start_hour * 60)) / 60.0) * hour_h
-                x1 = time_col_w + day_idx * day_col_w + 4
-                x2 = x1 + day_col_w - 8
+    # ── Drawing helpers ───────────────────────────────────────────────────
 
-                border_color, fill_color = get_subject_colors(sess.get('subject_id', 0))
-                status = sess.get('status', 'planned')
+    def _time_to_y(self, time_str, header_h, start_hour, hour_h):
+        m   = time_to_minutes(time_str)
+        rel = m - start_hour * 60
+        return header_h + (rel / 60.0) * hour_h
 
-                # Card tag for click detection
-                tag = f"sess_{sess['session_id']}"
-                self.session_card_map[tag] = sess
+    def _col_x(self, day_idx, day_col_w, time_col_w, margin=4):
+        return time_col_w + day_idx * day_col_w + margin
 
-                # Status modifications
-                status_icon = "⏳"
-                if status == 'done':
-                    status_icon = "✓"
-                    border_color = STATUS_DONE
-                    fill_color = '#EAF2E8'
-                elif status == 'missed':
-                    status_icon = "✕"
-                    border_color = STATUS_MISSED
-                    fill_color = '#FDEDEC'
+    def _draw_class_block(self, s, day_idx, day_col_w, time_col_w,
+                          header_h, start_hour, hour_h, grid_h):
+        y1 = self._time_to_y(s['start_time'], header_h, start_hour, hour_h)
+        y2 = self._time_to_y(s['end_time'],   header_h, start_hour, hour_h)
+        x1 = self._col_x(day_idx, day_col_w, time_col_w)
+        x2 = x1 + day_col_w - 8
 
-                # Draw Card Rect
-                card_id = self.canvas.create_rectangle(
-                    x1, y1, x2, y2,
-                    fill=fill_color,
-                    outline=border_color,
-                    width=2,
-                    tags=(tag, 'session_card')
-                )
+        y1c = max(y1, header_h)
+        y2c = min(y2, grid_h)
+        if y2c <= y1c:
+            return
 
-                # Header text: [Status] Subject Code
-                header_text = f"{status_icon} {sess.get('subject_code', '')} {sess.get('scheduled_start')}-{sess.get('scheduled_end')}"
-                self.canvas.create_text(
-                    x1 + 6, y1 + 5,
-                    text=header_text,
-                    anchor='nw',
-                    font=('Segoe UI', 8, 'bold'),
-                    fill=border_color,
-                    tags=(tag, 'session_text')
-                )
+        self.canvas.create_rectangle(x1, y1c, x2, y2c,
+                                     fill='#EBE8DF', outline='#BEBBAF', dash=(3, 3))
+        label = f"🏛 {s.get('subject_code','')}"
+        if s.get('section'):
+            label += f" • {s['section']}"
+        self.canvas.create_text(x1 + 5, y1c + 7, text=label, anchor='nw',
+                                font=('Segoe UI', 7, 'italic'), fill='#555555')
 
-                # Topic name text
-                # Truncate if long
-                card_w_chars = int((x2 - x1) / 7)
-                topic_title = sess.get('topic_name', '')
-                if len(topic_title) > card_w_chars:
-                    topic_title = topic_title[:card_w_chars - 3] + "..."
+    def _draw_exam_block(self, ex, day_idx, day_col_w, time_col_w,
+                         header_h, start_hour, hour_h, grid_h):
+        y1 = self._time_to_y(ex['start_time'], header_h, start_hour, hour_h)
+        y2 = self._time_to_y(ex['end_time'],   header_h, start_hour, hour_h)
+        x1 = self._col_x(day_idx, day_col_w, time_col_w)
+        x2 = x1 + day_col_w - 8
+        self.canvas.create_rectangle(x1, y1, x2, y2,
+                                     fill='#FADBD8', outline=STATUS_MISSED, width=2)
+        self.canvas.create_text(x1 + 5, y1 + 5,
+                                text=f"⚠ EXAM: {ex.get('subject_code','')}",
+                                anchor='nw', font=('Segoe UI', 8, 'bold'), fill='#78281F')
 
-                self.canvas.create_text(
-                    x1 + 6, y1 + 20,
-                    text=topic_title,
-                    anchor='nw',
-                    font=('Segoe UI', 8),
-                    fill=TEXT_COLOR,
-                    tags=(tag, 'session_text')
-                )
+    def _draw_session_card(self, sess, day_idx, day_col_w, time_col_w,
+                           header_h, start_hour, hour_h, grid_h):
+        y1 = self._time_to_y(sess['scheduled_start'], header_h, start_hour, hour_h)
+        y2 = self._time_to_y(sess['scheduled_end'],   header_h, start_hour, hour_h)
+        x1 = self._col_x(day_idx, day_col_w, time_col_w, margin=6)
+        x2 = x1 + day_col_w - 12
+
+        border_c, fill_c = get_subject_colors(sess.get('subject_id', 0))
+        status = sess.get('status', 'planned')
+        icon   = "⏳"
+        if status == 'done':
+            icon = "✓"; border_c = STATUS_DONE;   fill_c = '#EAF2E8'
+        elif status == 'missed':
+            icon = "✕"; border_c = STATUS_MISSED; fill_c = '#FDEDEC'
+
+        tag = f"sess_{sess['session_id']}"
+        self.session_card_map[tag] = sess
+
+        self.canvas.create_rectangle(x1, y1, x2, y2,
+                                     fill=fill_c, outline=border_c, width=2,
+                                     tags=(tag, 'session_card'))
+        # Time + status line
+        hdr = f"{icon} {sess.get('subject_code','')}  {sess.get('scheduled_start')}–{sess.get('scheduled_end')}"
+        self.canvas.create_text(x1 + 5, y1 + 4, text=hdr, anchor='nw',
+                                font=('Segoe UI', 7, 'bold'), fill=border_c,
+                                tags=(tag, 'session_text'))
+        # Topic name
+        max_chars = max(1, int((x2 - x1) / 7))
+        topic = sess.get('topic_name', '')
+        if len(topic) > max_chars:
+            topic = topic[:max_chars - 2] + '…'
+        self.canvas.create_text(x1 + 5, y1 + 17, text=topic, anchor='nw',
+                                font=('Segoe UI', 7), fill=TEXT_COLOR,
+                                tags=(tag, 'session_text'))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Session interaction
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _on_canvas_click(self, event):
-        """Detects clicks on study session cards and opens the action modal."""
-        # Adjust for canvas scrolling
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
-        clicked_items = self.canvas.find_overlapping(cx - 1, cy - 1, cx + 1, cy + 1)
-
-        for item in clicked_items:
-            tags = self.canvas.gettags(item)
-            for t in tags:
+        for item in self.canvas.find_overlapping(cx - 1, cy - 1, cx + 1, cy + 1):
+            for t in self.canvas.gettags(item):
                 if t in self.session_card_map:
-                    session = self.session_card_map[t]
-                    self._open_session_modal(session)
+                    self._open_session_modal(self.session_card_map[t])
                     return
 
     def _open_session_modal(self, session):
-        """Displays interactive action dialog to mark Done or Missed (reflow)."""
         modal = tk.Toplevel(self)
-        modal.title(f"Study Session #{session['session_id']}")
-        modal.geometry("450x330")
+        modal.title(f"Session #{session['session_id']}")
+        modal.geometry("460x320")
         modal.configure(bg=BG_COLOR)
         modal.resizable(False, False)
         modal.transient(self)
         modal.grab_set()
 
-        # Center dialog
+        # Center it
         modal.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() // 2) - 225
-        y = self.winfo_rooty() + (self.winfo_height() // 2) - 165
+        x = self.winfo_rootx() + self.winfo_width() // 2 - 230
+        y = self.winfo_rooty() + self.winfo_height() // 2 - 160
         modal.geometry(f"+{x}+{y}")
 
-        content = ttk.Frame(modal, style='TFrame', padding=20)
-        content.pack(fill='both', expand=True)
+        cnt = ttk.Frame(modal, style='TFrame', padding=20)
+        cnt.pack(fill='both', expand=True)
 
-        ttk.Label(
-            content,
-            text=f"Session: {session.get('subject_code', '')} — {session.get('subject_name', '')}",
-            style='Header.TLabel'
-        ).pack(anchor='w', pady=(0, 4))
+        ttk.Label(cnt, text=f"{session.get('subject_code','')} — {session.get('subject_name','')}",
+                  style='Header.TLabel').pack(anchor='w', pady=(0, 4))
+        ttk.Label(cnt, text=f"Topic: {session.get('topic_name','')}",
+                  font=('Segoe UI', 11, 'bold'), foreground=TEXT_COLOR).pack(anchor='w', pady=(0, 6))
 
-        ttk.Label(
-            content,
-            text=f"Topic: {session.get('topic_name', '')}",
-            font=('Segoe UI', 11, 'bold'),
-            foreground=TEXT_COLOR
-        ).pack(anchor='w', pady=(0, 6))
+        info = ttk.LabelFrame(cnt, text=" Details ", padding=10)
+        info.pack(fill='x', pady=6)
 
-        info_box = ttk.LabelFrame(content, text=" Session Details ", padding=10)
-        info_box.pack(fill='x', pady=6)
+        ttk.Label(info, text=(
+            f"📅 {session.get('scheduled_date')}  •  "
+            f"🕒 {session.get('scheduled_start')} – {session.get('scheduled_end')}"
+        )).pack(anchor='w', pady=2)
 
-        dt_info = f"📅 Date: {session.get('scheduled_date')}  |  🕒 {session.get('scheduled_start')} – {session.get('scheduled_end')}"
-        ttk.Label(info_box, text=dt_info).pack(anchor='w', pady=2)
+        status = session.get('status', 'planned').upper()
+        sc = STATUS_DONE if status == 'DONE' else (STATUS_MISSED if status == 'MISSED' else ACCENT_COLOR)
+        tk.Label(info, text=f"Status: {status}", font=('Segoe UI', 10, 'bold'),
+                 fg=sc, bg=BG_COLOR).pack(anchor='w', pady=2)
 
-        cur_status = session.get('status', 'planned').upper()
-        status_color = STATUS_DONE if cur_status == 'DONE' else (STATUS_MISSED if cur_status == 'MISSED' else ACCENT_COLOR)
-        lbl_st = tk.Label(
-            info_box,
-            text=f"Current Status: {cur_status}",
-            font=('Segoe UI', 10, 'bold'),
-            fg=status_color,
-            bg=BG_COLOR
-        )
-        lbl_st.pack(anchor='w', pady=2)
-
-        # Action Buttons
-        btn_box = ttk.Frame(content, style='TFrame')
-        btn_box.pack(fill='x', pady=(15, 0))
+        btn_box = ttk.Frame(cnt, style='TFrame')
+        btn_box.pack(fill='x', pady=(14, 0))
 
         def on_done():
             queries.update_study_session_status(self.conn, session['session_id'], 'done')
@@ -433,123 +459,106 @@ class PlannerScreen(ttk.Frame):
                 self.on_data_change()
 
         def on_missed():
-            # Trigger automatic reflow!
             res = reflow_on_missed(session['session_id'], self.conn)
             modal.destroy()
             self.refresh()
             if self.on_data_change:
                 self.on_data_change()
-
-            # Surface reflow result notification
-            cnt = res.get('reflowed_sessions_count', 0)
-            unsched = res.get('unscheduled_topics', [])
-            self.unscheduled_topics = unsched
-            self._update_banner(unsched)
-
-            msg = f"Session marked as Missed.\nSuccessfully reflowed {cnt} remaining study session(s)!"
-            if unsched:
-                msg += f"\n\n⚠️ Note: {len(unsched)} topic(s) could not be fully scheduled before upcoming exams."
-            messagebox.showinfo("Adaptive Reflow Complete", msg)
+            self.unscheduled_topics = res.get('unscheduled_topics', [])
+            self._update_banner(self.unscheduled_topics)
+            cnt_r = res.get('reflowed_sessions_count', 0)
+            msg = f"Marked as Missed. Reflowed {cnt_r} sessions!"
+            if self.unscheduled_topics:
+                msg += f"\n\n⚠ {len(self.unscheduled_topics)} topic(s) have insufficient slots before exams."
+            messagebox.showinfo("Adaptive Reflow", msg)
 
         def on_delete():
-            if messagebox.askyesno("Confirm Delete", "Delete this scheduled study session?"):
+            if messagebox.askyesno("Confirm", "Delete this session?"):
                 queries.delete_study_session(self.conn, session['session_id'])
                 modal.destroy()
                 self.refresh()
                 if self.on_data_change:
                     self.on_data_change()
 
-        btn_done = ttk.Button(btn_box, text="✓ Mark as Done", style='Accent.TButton', command=on_done)
-        btn_done.pack(side='left', padx=3)
+        ttk.Button(btn_box, text="✓ Mark Done",                 style='Accent.TButton',   command=on_done).pack(side='left', padx=3)
+        ttk.Button(btn_box, text="✕ Missed (Auto-Reflow)",      style='Danger.TButton',   command=on_missed).pack(side='left', padx=3)
+        ttk.Button(btn_box, text="Delete",                      style='Secondary.TButton',command=on_delete).pack(side='left', padx=3)
 
-        btn_missed = ttk.Button(btn_box, text="✕ Mark Missed (Auto-Reflow)", style='Danger.TButton', command=on_missed)
-        btn_missed.pack(side='left', padx=3)
-
-        btn_del = ttk.Button(btn_box, text="Delete", style='Secondary.TButton', command=on_delete)
-        btn_del.pack(side='left', padx=3)
-
-    def _update_banner(self, unscheduled):
-        if not unscheduled:
-            self.banner_frame.pack_forget()
-        else:
-            names = ", ".join([f"{u['subject_name']}: {u['topic_name']} ({u['unallocated_hours']}h left)" for u in unscheduled[:2]])
-            if len(unscheduled) > 2:
-                names += f" and {len(unscheduled) - 2} more"
-            self.lbl_banner.config(
-                text=f"⚠️ Insufficient free slots before exams: {names}."
-            )
-            self.banner_frame.pack(fill='x', padx=20, pady=(0, 6), before=self.legend_frame)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Study plan generation
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _generate_plan_dialog(self):
-        """Generates or rebuilds the entire study plan from scratch across available free time."""
-        if messagebox.askyesno(
-            "Generate Study Plan",
-            "This will calculate topic urgencies and schedule study sessions across your free time.\n"
-            "Existing 'planned' sessions will be replaced. 'Done' sessions will be preserved.\n\n"
-            "Proceed?"
-        ):
+        if messagebox.askyesno("Auto-Generate Study Plan",
+                               "Existing planned sessions will be replaced.\n"
+                               "'Done' sessions are preserved.\n\nProceed?"):
             self.rebuild_study_plan()
 
     def rebuild_study_plan(self):
-        """Runs the pure scheduler and saves generated sessions to DB."""
-        today = datetime.date.today()
-        # 1. Clear planned sessions from today onwards
-        queries.clear_planned_study_sessions(self.conn, from_date=today.strftime('%Y-%m-%d'))
+        today     = datetime.date.today()
+        today_str = today.strftime('%Y-%m-%d')
+        queries.clear_planned_study_sessions(self.conn, from_date=today_str)
 
-        # 2. Get topics and remaining hours
-        all_topics = queries.get_all_topics(self.conn)
-        timetable_slots = queries.get_all_timetable_slots(self.conn)
-        exams = queries.get_all_exams(self.conn)
-
-        # Get completed hours per topic
+        # Remaining hours = estimated – done
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT topic_id, 
-                   SUM((strftime('%s', '2000-01-01 ' || scheduled_end) - 
-                        strftime('%s', '2000-01-01 ' || scheduled_start)) / 3600.0) AS done_hrs
-            FROM StudySessions
-            WHERE status = 'done'
-            GROUP BY topic_id
+            SELECT topic_id,
+                   SUM((strftime('%s','2000-01-01 '||scheduled_end) -
+                        strftime('%s','2000-01-01 '||scheduled_start)) / 3600.0) AS done_hrs
+            FROM StudySessions WHERE status='done' GROUP BY topic_id
         """)
         done_map = {row['topic_id']: (row['done_hrs'] or 0.0) for row in cursor.fetchall()}
 
-        topics_to_schedule = []
-        for t in all_topics:
-            done_hrs = done_map.get(t['topic_id'], 0.0)
-            rem = max(0.0, round(float(t['estimated_hours']) - done_hrs, 2))
+        topics_to_sched = []
+        for t in queries.get_all_topics(self.conn):
+            rem = max(0.0, round(float(t['estimated_hours']) - done_map.get(t['topic_id'], 0.0), 2))
             if rem > 0:
-                t_dict = dict(t)
-                t_dict['estimated_hours'] = rem
-                topics_to_schedule.append(t_dict)
+                tc = dict(t); tc['estimated_hours'] = rem
+                topics_to_sched.append(tc)
 
-        # 3. Generate free slots for the next 21 days
-        planning_days = [today + datetime.timedelta(days=i) for i in range(21)]
-        free_slots = get_free_slots(timetable_slots, planning_days, exams=exams)
+        pivot_date = queries.get_setting(self.conn, 'pivot_date')
+        pivot_do   = int(queries.get_setting(self.conn, 'pivot_day_order', '1'))
 
-        # 4. Run scheduler
-        plan_result = build_schedule(topics_to_schedule, free_slots, reference_date=today)
+        timetable_slots = queries.get_all_timetable_slots(self.conn)
+        exams           = queries.get_all_exams(self.conn)
+        planning_days   = [today + datetime.timedelta(days=i) for i in range(21)]
+        free_slots      = get_free_slots(timetable_slots, planning_days, exams, pivot_date, pivot_do)
 
-        # 5. Insert new planned sessions
+        plan = build_schedule(topics_to_sched, free_slots, reference_date=today)
+
         with self.conn:
-            for s in plan_result['sessions']:
+            for s in plan['sessions']:
                 queries.insert_study_session(
                     self.conn,
-                    topic_id=s['topic_id'],
-                    scheduled_date=s['scheduled_date'],
-                    scheduled_start=s['scheduled_start'],
-                    scheduled_end=s['scheduled_end'],
-                    status='planned'
+                    topic_id        = s['topic_id'],
+                    scheduled_date  = s['scheduled_date'],
+                    scheduled_start = s['scheduled_start'],
+                    scheduled_end   = s['scheduled_end'],
+                    status          = 'planned',
                 )
 
-        self.unscheduled_topics = plan_result['unscheduled_topics']
+        self.unscheduled_topics = plan['unscheduled_topics']
         self._update_banner(self.unscheduled_topics)
         self.refresh()
         if self.on_data_change:
             self.on_data_change()
 
-        cnt = len(plan_result['sessions'])
-        msg = f"Schedule generated successfully! Created {cnt} study sessions."
+        msg = f"Schedule generated! {len(plan['sessions'])} sessions created."
         if self.unscheduled_topics:
-            msg += f"\n\n⚠️ {len(self.unscheduled_topics)} topic(s) had insufficient time before their exam dates."
+            msg += f"\n\n⚠ {len(self.unscheduled_topics)} topic(s) could not be fully scheduled before exams."
         messagebox.showinfo("Planner", msg)
 
+    # ── Banner utility ────────────────────────────────────────────────────────
+
+    def _update_banner(self, unscheduled):
+        if not unscheduled:
+            self.banner_frame.pack_forget()
+        else:
+            names = ", ".join(
+                f"{u['subject_name']}: {u['topic_name']} ({u['unallocated_hours']}h)"
+                for u in unscheduled[:2]
+            )
+            if len(unscheduled) > 2:
+                names += f" +{len(unscheduled) - 2} more"
+            self.lbl_banner.config(text=f"⚠ Insufficient slots before exams: {names}")
+            self.banner_frame.pack(fill='x', padx=20, pady=(0, 4), before=self.legend_frame)

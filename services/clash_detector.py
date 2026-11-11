@@ -1,180 +1,166 @@
 """
 Clash Detection Service for ClashBoard.
-Layer: services/ (pure functions, zero GUI/Tkinter imports, unit-testable).
+Layer: services/ — pure functions, zero GUI/Tkinter imports.
 
-Detects three types of scheduling conflicts:
-1. class-class: Two timetable classes on the same day overlap in time.
-2. class-exam: A regular timetable class on a given weekday overlaps with an exam scheduled on that calendar date.
-3. exam-exam: Two exams scheduled on the same calendar date overlap in time.
+Three conflict types:
+  class-class : Two Timetable slots on the same Day Order overlap in time.
+  class-exam  : A recurring class (DO-based) collides with an exam on a calendar date
+                whose Day Order matches.
+  exam-exam   : Two exams on the same calendar date overlap in time.
 """
 import datetime
+from services.day_order import get_day_order
 
 
-def time_to_minutes(time_str):
-    """Converts 'HH:MM' string to minutes from 00:00."""
+def time_to_minutes(time_str: str) -> int:
+    """'HH:MM' → minutes from midnight."""
     try:
-        parts = time_str.strip().split(':')
-        h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
-        return h * 60 + m
+        h, m = time_str.strip().split(':')
+        return int(h) * 60 + int(m)
     except Exception:
         return 0
 
 
-def minutes_to_time(minutes):
-    """Converts integer minutes to 'HH:MM' string."""
+def minutes_to_time(minutes: int) -> str:
+    """minutes from midnight → 'HH:MM'."""
     h = (minutes // 60) % 24
     m = minutes % 60
     return f"{h:02d}:{m:02d}"
 
 
-def ranges_overlap(start_a, end_a, start_b, end_b):
+def ranges_overlap(start_a, end_a, start_b, end_b) -> bool:
     """
-    Determines if two time ranges overlap.
-    Handles 'HH:MM' 24-hr string inputs or integer minute inputs.
-    Standard definition: start_a < end_b and start_b < end_a.
+    Returns True if the two time intervals overlap (exclusive endpoints).
+    Accepts 'HH:MM' strings or integer minutes.
+    Handles midnight-crossing intervals.
     """
     if isinstance(start_a, str):
-        # In 24-hr 'HH:MM' format, string comparison works identically to minutes
-        # unless an interval wraps midnight.
-        min_sa = time_to_minutes(start_a)
-        min_ea = time_to_minutes(end_a)
-        min_sb = time_to_minutes(start_b)
-        min_eb = time_to_minutes(end_b)
-
-        # Handle midnight wrap (e.g. 23:00 to 01:00)
-        if min_ea <= min_sa:
-            min_ea += 24 * 60
-        if min_eb <= min_sb:
-            min_eb += 24 * 60
-
-        return min_sa < min_eb and min_sb < min_ea
-    else:
-        return start_a < end_b and start_b < end_a
+        sa, ea = time_to_minutes(start_a), time_to_minutes(end_a)
+        sb, eb = time_to_minutes(start_b), time_to_minutes(end_b)
+        if ea <= sa:
+            ea += 24 * 60       # midnight wrap
+        if eb <= sb:
+            eb += 24 * 60
+        return sa < eb and sb < ea
+    return start_a < end_b and start_b < end_a
 
 
-def get_weekday_from_date(date_str):
+def detect_clashes(timetable_entries, exams, pivot_date: str = None, pivot_day_order: int = 1):
     """
-    Converts 'YYYY-MM-DD' into three-letter weekday: 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'.
-    """
-    try:
-        dt = datetime.date.fromisoformat(date_str)
-        return dt.strftime('%a')
-    except Exception:
-        return ""
+    Detect all three types of scheduling conflicts.
 
+    Parameters
+    ----------
+    timetable_entries : list[dict]  — rows from Timetable (each has 'day_order')
+    exams             : list[dict]  — rows from Exams
+    pivot_date        : str         — 'YYYY-MM-DD' anchor for Day Order calendar mapping
+    pivot_day_order   : int         — Day Order (1–5) on pivot_date
 
-def detect_clashes(timetable_entries, exams):
+    Returns a list of dicts ready to INSERT into the Clashes table.
     """
-    Compare every same-day pair of timetable entries -> clash_type 'class-class'.
-    Compare every timetable entry against exams on the same date -> 'class-exam'.
-    Compare every pair of exams on the same date -> 'exam-exam'.
-    Group entries by day/date first, then check ranges_overlap() pairwise within each group.
-    
-    Returns a list of dicts ready to insert into the Clashes table:
-    [
-        {
-            'slot_id_1': int or None,
-            'slot_id_2': int or None,
-            'exam_id': int or None,
-            'clash_type': 'class-class' | 'class-exam' | 'exam-exam',
-            'detected_on': 'YYYY-MM-DD HH:MM:SS',
-            'description': '...'
-        },
-        ...
-    ]
-    """
-    clashes = []
-    now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if pivot_date is None:
+        today   = datetime.date.today()
+        monday  = today - datetime.timedelta(days=today.weekday())
+        pivot_date       = monday.strftime('%Y-%m-%d')
+        pivot_day_order  = 1
 
-    # 1. CLASS-CLASS CLASHES
-    # Group timetable entries by day_of_week
-    classes_by_day = {}
+    clashes  = []
+    now_ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Group timetable entries by day_order
+    classes_by_do: dict[int, list] = {}
     for entry in timetable_entries:
-        day = entry.get('day_of_week', '').capitalize()[:3]
-        if day:
-            classes_by_day.setdefault(day, []).append(entry)
+        do = int(entry.get('day_order', 0))
+        if do:
+            classes_by_do.setdefault(do, []).append(entry)
 
-    for day, entries in classes_by_day.items():
-        n = len(entries)
-        for i in range(n):
-            for j in range(i + 1, n):
-                a = entries[i]
-                b = entries[j]
-                if ranges_overlap(a['start_time'], a['end_time'], b['start_time'], b['end_time']):
-                    sub_a = a.get('subject_name') or a.get('subject_code') or f"Class #{a.get('slot_id')}"
-                    sec_a = f" ({a['section']})" if a.get('section') else ""
-                    sub_b = b.get('subject_name') or b.get('subject_code') or f"Class #{b.get('slot_id')}"
-                    sec_b = f" ({b['section']})" if b.get('section') else ""
-                    
+    # ── 1. class-class  (same Day Order, same timetable) ────────────────────
+    for do, entries in classes_by_do.items():
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                a, b = entries[i], entries[j]
+                if ranges_overlap(a['start_time'], a['end_time'],
+                                  b['start_time'], b['end_time']):
+                    sub_a = a.get('subject_name') or a.get('subject_code', f"Slot#{a.get('slot_id')}")
+                    sub_b = b.get('subject_name') or b.get('subject_code', f"Slot#{b.get('slot_id')}")
+                    room_a = f" [{a['section']}]" if a.get('section') else ""
+                    room_b = f" [{b['section']}]" if b.get('section') else ""
                     desc = (
-                        f"{sub_a}{sec_a} [{a['start_time']}-{a['end_time']}] overlaps with "
-                        f"{sub_b}{sec_b} [{b['start_time']}-{b['end_time']}] on {day}"
+                        f"Day Order {do}: {sub_a}{room_a} "
+                        f"[{a['start_time']}–{a['end_time']}] overlaps with "
+                        f"{sub_b}{room_b} [{b['start_time']}–{b['end_time']}]"
                     )
                     clashes.append({
                         'slot_id_1': a.get('slot_id'),
                         'slot_id_2': b.get('slot_id'),
-                        'exam_id': None,
+                        'exam_id'  : None,
                         'clash_type': 'class-class',
                         'detected_on': now_ts,
-                        'description': desc
+                        'description': desc,
                     })
 
-    # 2. EXAM-EXAM CLASHES
     # Group exams by exam_date
-    exams_by_date = {}
-    for exam in exams:
-        edate = exam.get('exam_date')
+    exams_by_date: dict[str, list] = {}
+    for ex in exams:
+        edate = ex.get('exam_date')
         if edate:
-            exams_by_date.setdefault(edate, []).append(exam)
+            exams_by_date.setdefault(edate, []).append(ex)
 
+    # ── 2. exam-exam  (same calendar date) ──────────────────────────────────
     for edate, ex_list in exams_by_date.items():
-        n = len(ex_list)
-        for i in range(n):
-            for j in range(i + 1, n):
-                ex_a = ex_list[i]
-                ex_b = ex_list[j]
-                if ranges_overlap(ex_a['start_time'], ex_a['end_time'], ex_b['start_time'], ex_b['end_time']):
-                    sub_a = ex_a.get('subject_name') or ex_a.get('subject_code') or f"Exam #{ex_a.get('exam_id')}"
-                    sub_b = ex_b.get('subject_name') or ex_b.get('subject_code') or f"Exam #{ex_b.get('exam_id')}"
+        for i in range(len(ex_list)):
+            for j in range(i + 1, len(ex_list)):
+                a, b = ex_list[i], ex_list[j]
+                if ranges_overlap(a['start_time'], a['end_time'],
+                                  b['start_time'], b['end_time']):
+                    sub_a = a.get('subject_name') or a.get('subject_code', f"Exam#{a.get('exam_id')}")
+                    sub_b = b.get('subject_name') or b.get('subject_code', f"Exam#{b.get('exam_id')}")
                     desc = (
-                        f"{sub_a} exam [{ex_a['start_time']}-{ex_a['end_time']}] overlaps with "
-                        f"{sub_b} exam [{ex_b['start_time']}-{ex_b['end_time']}] on {edate}"
+                        f"{sub_a} exam [{a['start_time']}–{a['end_time']}] overlaps with "
+                        f"{sub_b} exam [{b['start_time']}–{b['end_time']}] on {edate}"
                     )
                     clashes.append({
                         'slot_id_1': None,
                         'slot_id_2': None,
-                        'exam_id': ex_a.get('exam_id'),
+                        'exam_id'  : a.get('exam_id'),
                         'clash_type': 'exam-exam',
                         'detected_on': now_ts,
-                        'description': desc
+                        'description': desc,
                     })
 
-    # 3. CLASS-EXAM CLASHES
-    # For every exam, find which weekday it falls on, then compare against classes on that weekday
+    # ── 3. class-exam  (Day Order of exam date matches a timetable Day Order) ─
     for exam in exams:
         edate = exam.get('exam_date')
         if not edate:
             continue
-        weekday = get_weekday_from_date(edate)
-        classes_on_day = classes_by_day.get(weekday, [])
-        for cls in classes_on_day:
-            if ranges_overlap(cls['start_time'], cls['end_time'], exam['start_time'], exam['end_time']):
-                cls_sub = cls.get('subject_name') or cls.get('subject_code') or f"Class #{cls.get('slot_id')}"
-                cls_sec = f" ({cls['section']})" if cls.get('section') else ""
-                ex_sub = exam.get('subject_name') or exam.get('subject_code') or f"Exam #{exam.get('exam_id')}"
+        try:
+            exam_dt = datetime.date.fromisoformat(edate)
+        except ValueError:
+            continue
+
+        exam_do = get_day_order(exam_dt, pivot_date, pivot_day_order)
+        if exam_do is None:
+            continue   # exam on a weekend, can't collide with weekday classes
+
+        classes_on_do = classes_by_do.get(exam_do, [])
+        for cls in classes_on_do:
+            if ranges_overlap(cls['start_time'], cls['end_time'],
+                              exam['start_time'], exam['end_time']):
+                cls_sub  = cls.get('subject_name')  or cls.get('subject_code',  f"Slot#{cls.get('slot_id')}")
+                ex_sub   = exam.get('subject_name') or exam.get('subject_code', f"Exam#{exam.get('exam_id')}")
+                room_cls = f" [{cls['section']}]" if cls.get('section') else ""
                 desc = (
-                    f"{cls_sub}{cls_sec} class [{cls['start_time']}-{cls['end_time']}] overlaps with "
-                    f"{ex_sub} exam [{exam['start_time']}-{exam['end_time']}] on {edate} ({weekday})"
+                    f"{cls_sub}{room_cls} class [{cls['start_time']}–{cls['end_time']}] (Day Order {exam_do}) "
+                    f"overlaps with {ex_sub} exam [{exam['start_time']}–{exam['end_time']}] "
+                    f"on {edate}"
                 )
                 clashes.append({
                     'slot_id_1': cls.get('slot_id'),
                     'slot_id_2': None,
-                    'exam_id': exam.get('exam_id'),
+                    'exam_id'  : exam.get('exam_id'),
                     'clash_type': 'class-exam',
                     'detected_on': now_ts,
-                    'description': desc
+                    'description': desc,
                 })
 
     return clashes
-

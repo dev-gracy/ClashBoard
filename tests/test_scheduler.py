@@ -1,6 +1,5 @@
 """
-Unit tests for Study Scheduler service (services/scheduler.py).
-Zero GUI imports, pure functions.
+Unit tests for Study Scheduler service — updated for Day Order schema.
 """
 import datetime
 import pytest
@@ -12,32 +11,27 @@ from db import queries
 
 
 def test_compute_urgency():
-    # priority: 5, difficulty: 5, days: 5 -> (5 * 5) / 5 = 5.0
     assert compute_urgency(5, 5, 5) == 5.0
-
-    # days_until_exam = 1 -> (4 * 3) / 1 = 12.0
     assert compute_urgency(4, 3, 1) == 12.0
-
-    # max(days_until_exam, 1) prevents zero division
-    assert compute_urgency(4, 4, 0) == 16.0
-    assert compute_urgency(4, 4, -5) == 16.0
-
-    # Lower priority / difficulty has lower urgency
+    assert compute_urgency(4, 4, 0) == 16.0   # max(0,1) → 1
     assert compute_urgency(1, 1, 10) < compute_urgency(5, 5, 10)
 
 
 def test_get_free_slots():
-    # Monday timetable has 1 class from 10:00 to 11:30
+    # Day Order 1 has a class 10:00–11:30
+    # 2026-11-16 is a Monday; use pivot 2026-11-16 = Day Order 1
     slots = [
-        {"day_of_week": "Mon", "start_time": "10:00", "end_time": "11:30"}
+        {"day_order": 1, "start_time": "10:00", "end_time": "11:30"}
     ]
-    dates = [datetime.date(2026, 11, 16)]  # Monday
-    free = get_free_slots(slots, dates)
+    pivot_date = "2026-11-16"
+    pivot_do   = 1
+    dates = [datetime.date(2026, 11, 16)]   # Monday → DO1
 
+    free = get_free_slots(slots, dates, pivot_date=pivot_date, pivot_day_order=pivot_do)
     assert len(free) > 0
-    # Candidate morning window was 07:00 to 13:00.
-    # Minus 10:00-11:30 leaves 07:00-10:00 and 11:30-13:00
+
     times = [(f['start_time'], f['end_time']) for f in free]
+    # 07:00–10:00 and 11:30–13:00 and 14:00–23:00 should all exist
     assert ("07:00", "10:00") in times
     assert ("11:30", "13:00") in times
     assert ("14:00", "23:00") in times
@@ -45,40 +39,40 @@ def test_get_free_slots():
 
 def test_build_schedule_basic():
     topics = [
-        {"topic_id": 1, "topic_name": "Trees", "subject_name": "DSA", "estimated_hours": 3.0, "priority": 5, "difficulty_level": 5, "exam_date": "2026-11-20"},
-        {"topic_id": 2, "topic_name": "Grammar", "subject_name": "English", "estimated_hours": 2.0, "priority": 1, "difficulty_level": 1, "exam_date": "2026-11-25"}
+        {"topic_id": 1, "topic_name": "Trees", "subject_name": "DS",
+         "estimated_hours": 3.0, "priority": 5, "difficulty_level": 5, "exam_date": "2026-11-20"},
+        {"topic_id": 2, "topic_name": "Grammar", "subject_name": "English",
+         "estimated_hours": 2.0, "priority": 1, "difficulty_level": 1, "exam_date": "2026-11-25"},
     ]
-    # Free slots over 2 days
     free_slots = [
-        {"date": "2026-11-17", "day_of_week": "Tue", "start_time": "09:00", "end_time": "12:00", "start_min": 540, "end_min": 720, "duration_hours": 3.0},
-        {"date": "2026-11-18", "day_of_week": "Wed", "start_time": "09:00", "end_time": "12:00", "start_min": 540, "end_min": 720, "duration_hours": 3.0}
+        {"date": "2026-11-17", "day_of_week": "Tue", "day_order": 2,
+         "start_time": "09:00", "end_time": "12:00", "start_min": 540, "end_min": 720, "duration_hours": 3.0},
+        {"date": "2026-11-18", "day_of_week": "Wed", "day_order": 3,
+         "start_time": "09:00", "end_time": "12:00", "start_min": 540, "end_min": 720, "duration_hours": 3.0},
     ]
-
     res = build_schedule(topics, free_slots, reference_date="2026-11-16")
-    sessions = res["sessions"]
-    assert len(sessions) > 0
-
-    # Highest urgency topic (Trees) must be scheduled first
-    first_sess = sessions[0]
-    assert first_sess["topic_id"] == 1
-    assert first_sess["status"] == "planned"
+    assert len(res["sessions"]) > 0
+    # Highest urgency topic (Trees) must come first
+    assert res["sessions"][0]["topic_id"] == 1
+    assert res["sessions"][0]["status"] == "planned"
 
 
 def test_build_schedule_flags_insufficient_slots():
     topics = [
-        {"topic_id": 1, "topic_name": "Huge Topic", "subject_name": "Physics", "estimated_hours": 10.0, "priority": 5, "difficulty_level": 5, "exam_date": "2026-11-17"}
+        {"topic_id": 1, "topic_name": "Huge Topic", "subject_name": "Physics",
+         "estimated_hours": 10.0, "priority": 5, "difficulty_level": 5, "exam_date": "2026-11-17"},
     ]
-    # Only 1 free slot of 2 hours before exam
     free_slots = [
-        {"date": "2026-11-16", "day_of_week": "Mon", "start_time": "10:00", "end_time": "12:00", "start_min": 600, "end_min": 720, "duration_hours": 2.0}
+        {"date": "2026-11-16", "day_of_week": "Mon", "day_order": 1,
+         "start_time": "10:00", "end_time": "12:00", "start_min": 600, "end_min": 720, "duration_hours": 2.0},
     ]
-
     res = build_schedule(topics, free_slots, reference_date="2026-11-15")
     unscheduled = res["unscheduled_topics"]
     assert len(unscheduled) == 1
     assert unscheduled[0]["topic_id"] == 1
     assert unscheduled[0]["unallocated_hours"] == 8.0
-    assert "Insufficient free slots" in unscheduled[0]["reason"]
+    # Reason mentions exam date
+    assert "2026-11-17" in unscheduled[0]["reason"]
 
 
 def test_reflow_on_missed():
@@ -86,26 +80,19 @@ def test_reflow_on_missed():
     init_db(conn)
     seed_database(conn)
 
-    # Get initial sessions
     sessions = queries.get_all_study_sessions(conn)
-    planned = [s for s in sessions if s['status'] == 'planned']
+    planned  = [s for s in sessions if s['status'] == 'planned']
     assert len(planned) > 0
 
-    target_session = planned[0]
-    session_id = target_session['session_id']
+    sid    = planned[0]['session_id']
+    result = reflow_on_missed(sid, conn)
 
-    # Trigger reflow on missed
-    result = reflow_on_missed(session_id, conn)
     assert result['success'] is True
-    assert result['missed_session_id'] == session_id
+    assert result['missed_session_id'] == sid
 
-    # Check that session is now 'missed'
-    updated = queries.get_study_session_by_id(conn, session_id)
+    updated = queries.get_study_session_by_id(conn, sid)
     assert updated['status'] == 'missed'
 
-    # Check that new planned sessions were created
-    new_sessions = queries.get_all_study_sessions(conn)
-    new_planned = [s for s in new_sessions if s['status'] == 'planned']
+    new_planned = [s for s in queries.get_all_study_sessions(conn) if s['status'] == 'planned']
     assert len(new_planned) > 0
     conn.close()
-

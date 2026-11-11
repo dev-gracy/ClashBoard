@@ -9,10 +9,26 @@ Built with **Python 3**, **Tkinter (ttk 'clam' theme)**, and **SQLite3**.
 ## 1. Features
 
 - **Automatic Conflict Detection (`services/clash_detector.py`)**:
-  - **Class vs Class**: Detects overlapping timetable slots on the same weekday.
-  - **Class vs Exam**: Detects recurring classes that collide with an upcoming exam date.
+  - **Class vs Class**: Detects overlapping timetable slots within the same Day Order.
+  - **Class vs Exam**: Detects recurring classes whose Day Order collides with an upcoming exam date.
   - **Exam vs Exam**: Flags critical overlapping exam schedules.
   - Plain-English descriptions and actionable resolution advice.
+
+- **Day Order (DO 1–5) & Calendar Sync (`services/day_order.py`)**:
+  - Full Day Order rotational system (Day 1 through Day 5) cycling over academic working days (Mon–Fri).
+  - Preserves calendar dates (e.g. `Mon 16 Nov` labeled with `Day 1` badge).
+  - Configurable Day Order Anchor / Pivot date in the Weekly Planner.
+
+- **Real Timetable Curriculum**:
+  - Populated with authentic college schedule data:
+    - **Data Structures (DS)**
+    - **Transforms and Techniques (T&T)**
+    - **Operating Systems (OS)**
+    - **Professional Ethics (PE)**
+    - **Universal Human Values II (UHV)**
+    - **Computer Organization & Architecture (CO)**
+    - **Advanced Programming (AP)**
+  - 26 periods mapped across rooms `CLS 403`, `TP 704`, `UB 801`, `UB 714B`, and `ONLINE`.
 
 - **Urgency-Based Greedy Study Scheduler (`services/scheduler.py`)**:
   - Urgency Formula: `(priority * difficulty_level) / max(days_until_exam, 1)`
@@ -31,7 +47,7 @@ Built with **Python 3**, **Tkinter (ttk 'clam' theme)**, and **SQLite3**.
   5. **Progress Dashboard**: Embedded `matplotlib` bar chart (planned vs. completed hours per subject) and stat summary cards.
 
 - **Automatic Demo Seeder (`db/seed.py`)**:
-  - Auto-seeds on first run with 6 subjects, 15 weekly timetable slots (with an intentional clash demo), 4 upcoming exams, 20 topics, and pre-scheduled study sessions.
+  - Auto-seeds on first run with the authentic 7 college subjects, 26 Day Order timetable slots, upcoming exams, 24 topics, and pre-scheduled study sessions.
 
 ---
 
@@ -44,14 +60,16 @@ F:\APP Tkinter\
 ├── clashboard.db               # SQLite database (auto-generated on first run)
 ├── requirements.txt            # Dependencies
 ├── README.md                   # Documentation
+├── run.bat                     # Windows one-click launcher
 ├── db/                         # Layer 1: Database (Schema + Queries only)
 │   ├── __init__.py
 │   ├── connection.py           # SQLite connection with PRAGMA foreign_keys = ON
-│   ├── schema.py               # 6 table schemas
+│   ├── schema.py               # 7 table schemas (with Settings)
 │   ├── queries.py              # CRUD queries
-│   └── seed.py                 # Realistic college demo data
+│   └── seed.py                 # Authentic college timetable demo data
 ├── services/                   # Layer 2: Core Logic (Pure functions, zero GUI code)
 │   ├── __init__.py
+│   ├── day_order.py            # Day Order cycle & calendar date mapping
 │   ├── clash_detector.py       # Interval overlap & multi-type clash detection
 │   └── scheduler.py            # Urgency calculation, free slots, greedy schedule, reflow
 ├── gui/                        # Layer 3: Presentation (Tkinter only, ttk 'clam')
@@ -60,14 +78,15 @@ F:\APP Tkinter\
 │   ├── styles.py               # Clam styling, #2F5233 accent, muted palette, Segoe UI
 │   └── screens/
 │       ├── __init__.py
-│       ├── planner_screen.py   # Canvas 7-day interactive grid
-│       ├── timetable_screen.py # Timetable & exams CRUD
+│       ├── planner_screen.py   # Canvas 7-day interactive grid with Day Order badges
+│       ├── timetable_screen.py # Day Order timetable & exams CRUD
 │       ├── clash_screen.py     # Conflict report & guidance
 │       ├── subjects_screen.py  # Subjects & topics manager with ttk.Scale
 │       └── dashboard_screen.py # Matplotlib bar chart & analytics
 └── tests/                      # Automated test suite
     ├── test_db.py
     ├── test_clash_detector.py
+    ├── test_gui_smoke.py
     └── test_scheduler.py
 ```
 

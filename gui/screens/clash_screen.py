@@ -255,7 +255,9 @@ class ClashScreen(ttk.Frame):
         """Forces a full re-detection of clashes against current DB timetable & exams."""
         slots = queries.get_all_timetable_slots(self.conn)
         exams = queries.get_all_exams(self.conn)
-        clashes = detect_clashes(slots, exams)
+        pivot_date = queries.get_setting(self.conn, 'pivot_date')
+        pivot_do = int(queries.get_setting(self.conn, 'pivot_day_order', '1'))
+        clashes = detect_clashes(slots, exams, pivot_date, pivot_do)
         queries.save_clashes(self.conn, clashes)
         self.refresh()
         if self.on_clash_update:

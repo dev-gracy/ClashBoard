@@ -30,6 +30,11 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
 # Secrets & Environment variables
 .env
 .env.*
