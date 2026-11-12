@@ -581,3 +581,4 @@ python -m pytest -v
 
 ---
 *End of Complete Academic Project Report & Reference Manual.*
+
